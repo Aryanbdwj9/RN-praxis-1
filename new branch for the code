@@ -1,0 +1,270 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdbool.h>
+#include <ctype.h>
+
+// Constants
+#define BACKLOG 10
+#define BUFFER_SIZE 8192
+#define MAX_RESOURCES 100
+
+// Resource structure
+typedef struct {
+    char path[256];
+    char content[BUFFER_SIZE];
+    bool in_use;
+} Resource;
+
+// Resource storage
+Resource resources[MAX_RESOURCES];
+
+// Function prototypes
+void handle_request(int client_fd);
+Resource *find_resource(const char *path);
+Resource *create_resource(const char *path);
+void delete_resource(const char *path);
+void send_response(int client_fd, const char *status, const char *content);
+bool validate_request_format(const char *request);
+bool validate_headers(const char *request);
+
+int main(int argc, char *argv[]) {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <IP> <Port>\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    const char *ip = argv[1];
+    const char *port = argv[2];
+
+    // Create a socket
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("Socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Set SO_REUSEADDR
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt failed");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // Bind the socket
+    struct sockaddr_in server_addr = {0};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(atoi(port));
+    if (inet_pton(AF_INET, ip, &server_addr.sin_addr) <= 0) {
+        perror("Invalid address/ Address not supported");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Bind failed");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // Start listening
+    if (listen(server_fd, BACKLOG) < 0) {
+        perror("Listen failed");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Server listening on %s:%s\n", ip, port);
+
+    // Accept connections
+    while (1) {
+        struct sockaddr_in client_addr = {0};
+        socklen_t addr_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
+        if (client_fd < 0) {
+            perror("Accept failed");
+            continue;
+        }
+
+        printf("Connection accepted\n");
+
+        // Handle client request
+        handle_request(client_fd);
+
+        close(client_fd); // Close the client connection
+    }
+
+    close(server_fd); // Close the server socket
+    return 0;
+}
+
+// Function to handle the request
+void handle_request(int client_fd) {
+    char buffer[BUFFER_SIZE] = {0};
+    ssize_t bytes_read, total_bytes = 0;
+
+    // Receive multi-packet data
+    while ((bytes_read = recv(client_fd, buffer + total_bytes, BUFFER_SIZE - total_bytes - 1, 0)) > 0) {
+        total_bytes += bytes_read;
+        buffer[total_bytes] = '\0';
+        if (strstr(buffer, "\r\n\r\n") != NULL) {
+            break; // End of headers
+        }
+    }
+
+    if (bytes_read <= 0) {
+        send_response(client_fd, "400 Bad Request", "Malformed request");
+        return;
+    }
+
+    // Validate request format
+    if (!validate_request_format(buffer)) {
+        send_response(client_fd, "400 Bad Request", "Malformed request");
+        return;
+    }
+
+    char method[8], path[256], http_version[16];
+    sscanf(buffer, "%s %s %s", method, path, http_version);
+
+    // Check HTTP version
+    if (strcmp(http_version, "HTTP/1.1") != 0 && strcmp(http_version, "HTTP/1.0") != 0) {
+        send_response(client_fd, "400 Bad Request", "Unsupported HTTP version");
+        return;
+    }
+
+    // Validate headers
+    if (!validate_headers(buffer)) {
+        send_response(client_fd, "400 Bad Request", "Malformed headers");
+        return;
+    }
+
+    // Handle GET requests
+    if (strcmp(method, "GET") == 0) {
+        if (strcmp(path, "/static/foo") == 0) {
+            send_response(client_fd, "200 OK", "Foo");
+        } else if (strcmp(path, "/static/bar") == 0) {
+            send_response(client_fd, "200 OK", "Bar");
+        } else if (strcmp(path, "/static/baz") == 0) {
+            send_response(client_fd, "200 OK", "Baz");
+        } else if (strncmp(path, "/dynamic/", 9) == 0) {
+            Resource *res = find_resource(path);
+            if (res && res->in_use) {
+                send_response(client_fd, "200 OK", res->content);
+            } else {
+                send_response(client_fd, "404 Not Found", "Resource not found");
+            }
+        } else {
+            send_response(client_fd, "404 Not Found", "Resource not found");
+        }
+    }
+    // Handle unsupported methods
+    else if (strcmp(method, "PUT") == 0) {
+        if (strncmp(path, "/dynamic/", 9) == 0) {
+            Resource *res = create_resource(path);
+            if (res) {
+                const char *body = strstr(buffer, "\r\n\r\n") + 4;
+                strncpy(res->content, body, BUFFER_SIZE - 1);
+                res->content[BUFFER_SIZE - 1] = '\0';
+                send_response(client_fd, "201 Created", "Resource created");
+            } else {
+                send_response(client_fd, "500 Internal Server Error", "Failed to create resource");
+            }
+        } else {
+            send_response(client_fd, "403 Forbidden", "Forbidden");
+        }
+    } else {
+        send_response(client_fd, "501 Not Implemented", "Not Implemented");
+    }
+}
+
+// Function to validate the request format
+bool validate_request_format(const char *request) {
+    char method[8], path[256], http_version[16];
+    int fields = sscanf(request, "%s %s %s", method, path, http_version);
+
+    // Check if the start line has all fields
+    if (fields != 3) {
+        return false;
+    }
+
+    // Check if the method, path, and HTTP version are valid
+    if (strlen(method) > 7 || strlen(path) > 255 || strlen(http_version) > 15) {
+        return false;
+    }
+
+    return true;
+}
+
+// Function to validate headers
+bool validate_headers(const char *request) {
+    const char *headers_start = strstr(request, "\r\n") + 2;
+    const char *headers_end = strstr(request, "\r\n\r\n");
+
+    if (!headers_start || !headers_end || headers_start >= headers_end) {
+        return false;
+    }
+
+    char line[512];
+    while (headers_start < headers_end) {
+        const char *line_end = strstr(headers_start, "\r\n");
+        if (!line_end || line_end - headers_start >= (int)sizeof(line)) {
+            return false;
+        }
+
+        strncpy(line, headers_start, line_end - headers_start);
+        line[line_end - headers_start] = '\0';
+
+        char key[256], value[256];
+        if (sscanf(line, "%255[^:]: %255[^\r\n]", key, value) != 2) {
+            return false;
+        }
+
+        headers_start = line_end + 2;
+    }
+
+    return true;
+}
+
+// Function to send HTTP response
+void send_response(int client_fd, const char *status, const char *content) {
+    char response[BUFFER_SIZE];
+    snprintf(response, sizeof(response), "HTTP/1.1 %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
+             status, strlen(content), content);
+    send(client_fd, response, strlen(response), 0);
+}
+
+// Function to find resource by path
+Resource *find_resource(const char *path) {
+    for (int i = 0; i < MAX_RESOURCES; i++) {
+        if (resources[i].in_use && strcmp(resources[i].path, path) == 0) {
+            return &resources[i];
+        }
+    }
+    return NULL;
+}
+
+// Function to create a new resource
+Resource *create_resource(const char *path) {
+    for (int i = 0; i < MAX_RESOURCES; i++) {
+        if (!resources[i].in_use) {
+            strcpy(resources[i].path, path);
+            resources[i].in_use = true;
+            return &resources[i];
+        }
+    }
+    return NULL; // No space for new resources
+}
+
+// Function to delete a resource
+void delete_resource(const char *path) {
+    for (int i = 0; i < MAX_RESOURCES; i++) {
+        if (resources[i].in_use && strcmp(resources[i].path, path) == 0) {
+            resources[i].in_use = false; // Mark as unused
+            memset(resources[i].content, 0, sizeof(resources[i].content)); // Clear content
+        }
+    }
+}
