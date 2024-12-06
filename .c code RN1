@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <ctype.h>
 
+
 // Constants
 #define BACKLOG 10
 #define BUFFER_SIZE 8192
@@ -161,7 +162,7 @@ void handle_request(int client_fd) {
             send_response(client_fd, "404 Not Found", "Resource not found");
         }
     }
-    // Handle unsupported methods
+    // Handle PUT requests
     else if (strcmp(method, "PUT") == 0) {
         if (strncmp(path, "/dynamic/", 9) == 0) {
             Resource *res = create_resource(path);
@@ -176,7 +177,22 @@ void handle_request(int client_fd) {
         } else {
             send_response(client_fd, "403 Forbidden", "Forbidden");
         }
-    } else {
+    }
+    // Handle DELETE requests
+    else if (strcmp(method, "DELETE") == 0) {
+        if (strncmp(path, "/dynamic/", 9) == 0) {
+            Resource *res = find_resource(path);
+            if (res && res->in_use) {
+                delete_resource(path);  // Delete the resource
+                send_response(client_fd, "204 No Content", "Resource deleted");
+            } else {
+                send_response(client_fd, "404 Not Found", "Resource not found");
+            }
+        } else {
+            send_response(client_fd, "403 Forbidden", "Forbidden");
+        }
+    }
+    else {
         send_response(client_fd, "501 Not Implemented", "Not Implemented");
     }
 }
@@ -265,6 +281,10 @@ void delete_resource(const char *path) {
         if (resources[i].in_use && strcmp(resources[i].path, path) == 0) {
             resources[i].in_use = false; // Mark as unused
             memset(resources[i].content, 0, sizeof(resources[i].content)); // Clear content
+            return;
         }
     }
+    // If resource is not found
+    fprintf(stderr, "Resource %s not found for deletion\n", path);
 }
+
